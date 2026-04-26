@@ -145,7 +145,7 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-async def scrape_new_projects(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def scrape_new_projects(bot) -> None:
     """مهمة دورية لفحص المشاريع الجديدة"""
     logger.info("🔍 جاري البحث عن مشاريع جديدة...")
 
@@ -179,7 +179,7 @@ async def scrape_new_projects(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 )
 
                                 # إرسال للمستخدم الفردي
-                                await context.bot.send_message(
+                                await bot.send_message(
                                     chat_id=user_id,
                                     text=message,
                                     parse_mode='HTML'
@@ -189,7 +189,7 @@ async def scrape_new_projects(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 if SEND_TO_CHANNEL:
                                     try:
                                         channel_message = f"📢 <b>منصة مستقل</b>\n\n{message}\n\n#مستقل #{CATEGORIES[category_id].replace(' ', '_')}"
-                                        await context.bot.send_message(
+                                        await bot.send_message(
                                             chat_id=FREELANCER_CHANNEL_ID,
                                             text=channel_message,
                                             parse_mode='HTML'
@@ -224,14 +224,17 @@ async def scrape_new_projects(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 
+async def scraper_loop(bot) -> None:
+    """حلقة تشغيل مستمرة للـ scraper"""
+    await asyncio.sleep(10)
+    while True:
+        await scrape_new_projects(bot)
+        await asyncio.sleep(SCRAPE_INTERVAL)
+
+
 async def post_init(application: Application) -> None:
     """إعداد المهام الدورية بعد بدء التطبيق"""
-    application.job_queue.run_repeating(
-        scrape_new_projects,
-        interval=SCRAPE_INTERVAL,
-        first=10,
-        name='scrape_projects'
-    )
+    asyncio.create_task(scraper_loop(application.bot))
     logger.info("✅ تم بدء المهام الدورية")
 
 
