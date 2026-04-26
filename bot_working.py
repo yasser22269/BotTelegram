@@ -63,30 +63,39 @@ CAT_KEYWORDS = {
 
 ACTIVE_CATEGORIES = {"2"}   # Only these categories are scraped and notified
 
-users       = {}   # {user_id(int): {"name", "chat_id", "categories"}}
-seen_ids    = set()
-admin_state = {}
-last_id     = 0
-BOT_USERNAME = ""   # set after get_me()
+# ── Upwork OAuth 2.0 credentials (from .env) ──────────────────────────────────
+UPWORK_CLIENT_ID      = os.getenv('UPWORK_CLIENT_ID', '')
+UPWORK_CLIENT_SECRET  = os.getenv('UPWORK_CLIENT_SECRET', '')
+_upwork_access_token  = os.getenv('UPWORK_ACCESS_TOKEN', '')
+_upwork_refresh_token = os.getenv('UPWORK_REFRESH_TOKEN', '')
+
+users            = {}   # {user_id(int): {"name", "chat_id", "categories"}}
+seen_ids         = set()
+upwork_seen_ids  = set()
+admin_state      = {}
+last_id          = 0
+BOT_USERNAME     = ""   # set after get_me()
 
 
 # ── Storage ───────────────────────────────────────────────────────────────────
 
 def load_data():
-    global users, seen_ids
+    global users, seen_ids, upwork_seen_ids
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        users    = {int(k): v for k, v in data.get('users', {}).items()}
-        seen_ids = set(data.get('seen_ids', []))
-    logger.info(f"تم تحميل {len(users)} مستخدم، {len(seen_ids)} مشروع محفوظ")
+        users           = {int(k): v for k, v in data.get('users', {}).items()}
+        seen_ids        = set(data.get('seen_ids', []))
+        upwork_seen_ids = set(data.get('upwork_seen_ids', []))
+    logger.info(f"تم تحميل {len(users)} مستخدم، {len(seen_ids)} مستقل / {len(upwork_seen_ids)} Upwork")
 
 
 def save_data():
     with open(DATA_FILE, 'w', encoding='utf-8') as f:
         json.dump({
-            'users':    {str(k): v for k, v in users.items()},
-            'seen_ids': list(seen_ids)[-2000:],
+            'users':           {str(k): v for k, v in users.items()},
+            'seen_ids':        list(seen_ids)[-2000:],
+            'upwork_seen_ids': list(upwork_seen_ids)[-2000:],
         }, f, ensure_ascii=False, indent=2)
 
 
@@ -640,6 +649,185 @@ def format_scraped(p):
     )
 
 
+# ── Upwork OAuth 2.0 ──────────────────────────────────────────────────────────
+
+UPWORK_TOKEN_URL   = 'https://www.upwork.com/api/v3/oauth2/token'
+UPWORK_SEARCH_URL  = 'https://www.upwork.com/api/profiles/v2/search/jobs.json'
+UPWORK_REDIRECT    = 'https://www.upwork.com'
+
+def _upwork_refresh():
+    """Refresh the Upwork access token and persist to .env and global."""
+    global _upwork_access_token, _upwork_refresh_token
+    if not _upwork_refresh_token:
+        return False
+    try:
+        resp = requests.post(UPWORK_TOKEN_URL, data={
+            'grant_type':    'refresh_token',
+            'refresh_token': _upwork_refresh_token,
+            'client_id':     UPWORK_CLIENT_ID,
+            'client_secret': UPWORK_CLIENT_SECRET,
+            'redirect_uri':  UPWORK_REDIRECT,
+        }, timeout=15)
+        if resp.status_code != 200:
+            logger.error(f"Upwork refresh failed: {resp.status_code}")
+            return False
+        tokens = resp.json()
+        _upwork_access_token  = tokens.get('access_token', _upwork_access_token)
+        _upwork_refresh_token = tokens.get('refresh_token', _upwork_refresh_token)
+        # Persist to .env
+        env_path = os.path.join(os.path.dirname(__file__), '.env')
+        if os.path.exists(env_path):
+            import re as _re
+            with open(env_path, 'r', encoding='utf-8') as f:
+                txt = f.read()
+            txt = _re.sub(r'UPWORK_ACCESS_TOKEN=.*',  f'UPWORK_ACCESS_TOKEN={_upwork_access_token}',  txt)
+            txt = _re.sub(r'UPWORK_REFRESH_TOKEN=.*', f'UPWORK_REFRESH_TOKEN={_upwork_refresh_token}', txt)
+            with open(env_path, 'w', encoding='utf-8') as f:
+                f.write(txt)
+        logger.info("Upwork: تم تجديد الـ token")
+        return True
+    except Exception as e:
+        logger.error(f"Upwork refresh error: {e}")
+        return False
+
+
+def fetch_upwork_jobs():
+    """Fetch recent web/dev jobs from Upwork API (OAuth 2.0). Returns {job_id: job_dict}."""
+    global _upwork_access_token
+    if not all([UPWORK_CLIENT_ID, UPWORK_CLIENT_SECRET, _upwork_access_token]):
+        return {}
+
+    def _get(token):
+        return requests.get(
+            UPWORK_SEARCH_URL,
+            headers={'Authorization': f'Bearer {token}'},
+            params={
+                'q':            'web development programming mobile app',
+                'category2_uid': '531770282580668418',
+                'sort':         'recency',
+                'paging':       '0;20',
+            },
+            timeout=15,
+        )
+
+    try:
+        resp = _get(_upwork_access_token)
+        if resp.status_code == 401:
+            if _upwork_refresh():
+                resp = _get(_upwork_access_token)
+            else:
+                logger.error("Upwork: انتهت صلاحية الـ token — شغّل upwork_auth.py من جديد")
+                return {}
+        if resp.status_code != 200:
+            logger.error(f"Upwork API {resp.status_code}: {resp.text[:200]}")
+            return {}
+
+        data     = resp.json()
+        jobs_raw = data.get('jobs', {}).get('job', [])
+        if isinstance(jobs_raw, dict):
+            jobs_raw = [jobs_raw]
+
+        result = {}
+        for job in jobs_raw:
+            job_id = str(job.get('id', '')).strip()
+            if not job_id:
+                continue
+            budget_obj = job.get('budget', {}) or {}
+            if budget_obj.get('amount'):
+                budget = f"${budget_obj['amount']}"
+            elif budget_obj.get('min') and budget_obj.get('max'):
+                budget = f"${budget_obj['min']} - ${budget_obj['max']}"
+            else:
+                budget = ''
+            result[job_id] = {
+                'title':       job.get('title', '').strip(),
+                'description': (job.get('snippet', '') or '').strip()[:700],
+                'budget':      budget,
+                'duration':    job.get('duration', ''),
+                'date':        (job.get('date_created', '') or '')[:10],
+                'url':         f"https://www.upwork.com/jobs/~{job_id}",
+            }
+        return result
+    except Exception as e:
+        logger.error(f"Upwork fetch: {e}")
+        return {}
+
+
+def format_upwork(job):
+    budget_line   = f"💵 {job['budget']}\n"   if job.get('budget')   else ""
+    duration_line = f"⌛ {job['duration']}\n" if job.get('duration') else ""
+    date_line     = f"📅 {job['date'][:10]}\n" if job.get('date')    else ""
+    return (
+        f"🌐 المصدر: upwork.com\n\n"
+        f"🎯 {job['title']}\n"
+        f"📂 برمجة، تطوير المواقع والتطبيقات\n"
+        f"{budget_line}"
+        f"{duration_line}"
+        f"{date_line}"
+        f"\n~~~~ الوصف ~~~~\n"
+        f"{job.get('description', '')}\n"
+        f"\n🔗 {job['url']}"
+    )
+
+
+def upwork_loop(bot):
+    """Separate thread: poll Upwork every SCRAPE_INTERVAL seconds."""
+    if not UPWORK_CONSUMER_KEY:
+        logger.info("Upwork: بيانات API غير موجودة — تم التخطي")
+        return
+
+    # Init: mark existing jobs as seen
+    try:
+        existing = fetch_upwork_jobs()
+        for jid in existing:
+            upwork_seen_ids.add(jid)
+        save_data()
+        logger.info(f"Upwork init: {len(existing)} وظيفة موجودة محفوظة")
+    except Exception as e:
+        logger.error(f"Upwork init: {e}")
+
+    time.sleep(SCRAPE_INTERVAL)
+
+    while True:
+        try:
+            jobs = fetch_upwork_jobs()
+            new  = {jid: j for jid, j in jobs.items() if jid not in upwork_seen_ids}
+            if new:
+                logger.info(f"Upwork: {len(new)} وظيفة جديدة")
+            for jid, job in new.items():
+                try:
+                    content  = format_upwork(job)
+                    keyboard = job_subscribe_keyboard("2")
+                    try:
+                        bot.send_message(FREELANCER_CHANNEL_ID, content, reply_markup=keyboard)
+                    except Exception as e:
+                        logger.error(f"Upwork القناة: {e}")
+
+                    targets = [u for u in users.values()
+                               if isinstance(u, dict) and "2" in u.get('categories', [])]
+                    sent = failed = 0
+                    for u in targets:
+                        try:
+                            bot.send_message(u['chat_id'], content)
+                            sent += 1
+                            time.sleep(0.05)
+                        except Exception as dm_e:
+                            failed += 1
+                            logger.warning(f"Upwork DM فشل → {u.get('name','?')}: {dm_e}")
+
+                    logger.info(f"Upwork نُشر {jid} | {sent} نجح / {failed} فشل | {job['title'][:40]}")
+                    upwork_seen_ids.add(jid)
+                    save_data()
+                    time.sleep(2)
+                except Exception as e:
+                    logger.error(f"Upwork خطأ {jid}: {e}")
+                    upwork_seen_ids.add(jid)
+        except Exception as e:
+            logger.error(f"Upwork loop: {e}")
+
+        time.sleep(SCRAPE_INTERVAL)
+
+
 def scraper_loop(bot):
     logger.info(f"Scraper بدأ — كل {SCRAPE_INTERVAL}s")
     try:
@@ -788,6 +976,7 @@ def main():
     print("="*60 + "\n")
 
     threading.Thread(target=scraper_loop, args=(bot,), daemon=True).start()
+    threading.Thread(target=upwork_loop,  args=(bot,), daemon=True).start()
     logger.info("البوت يعمل!")
 
     ALLOWED_UPDATES = ['message', 'callback_query', 'chat_member']
