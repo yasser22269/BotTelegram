@@ -11,8 +11,6 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
     ContextTypes, ConversationHandler
 )
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.interval import IntervalTrigger
 from datetime import datetime
 
 from database import Database
@@ -228,19 +226,12 @@ async def scrape_new_projects(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def post_init(application: Application) -> None:
     """إعداد المهام الدورية بعد بدء التطبيق"""
-    scheduler = AsyncIOScheduler()
-
-    # إضافة مهمة فحص المشاريع الجديدة
-    scheduler.add_job(
+    application.job_queue.run_repeating(
         scrape_new_projects,
-        trigger=IntervalTrigger(seconds=SCRAPE_INTERVAL),
-        args=(application.context_types.context,),
-        id='scrape_projects',
-        name='فحص المشاريع الجديدة',
-        replace_existing=True
+        interval=SCRAPE_INTERVAL,
+        first=10,
+        name='scrape_projects'
     )
-
-    scheduler.start()
     logger.info("✅ تم بدء المهام الدورية")
 
 
