@@ -772,7 +772,7 @@ def format_upwork(job):
 
 def upwork_loop(bot):
     """Separate thread: poll Upwork every SCRAPE_INTERVAL seconds."""
-    if not UPWORK_CONSUMER_KEY:
+    if not all([UPWORK_CLIENT_ID, UPWORK_CLIENT_SECRET, _upwork_access_token]):
         logger.info("Upwork: بيانات API غير موجودة — تم التخطي")
         return
 
