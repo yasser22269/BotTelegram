@@ -24,11 +24,26 @@
 
 ### إضافة الـ cron (مطلوبة مرة واحدة)
 
-hPanel → Advanced → Cron Jobs، كل 5 دقائق:
+hPanel → Advanced → Cron Jobs، كل 5 دقائق. **لازم `/bin/bash` بالتحديد:**
 
 ```
-/home/u321534789/bots/mustaqbal-bot/keepalive.sh
+/bin/bash /home/u321534789/bots/mustaqbal-bot/keepalive.sh
 ```
+
+> ⚠️ لا تستخدم `/usr/bin/php` — PHP بيطبع السكربت كنص بدون تنفيذ، وكمان
+> `shell_exec` و`exec` و`system` و`passthru` و`popen` كلهم معطّلين على الاستضافة
+> دي، فمفيش أي طريقة PHP تقدر تشغّل الـ keepalive.
+
+### التحقق إن الطبقات شغالة
+
+كل نداء لـ `keepalive.sh` بيسجّل بصمة وقت باسم مصدره:
+
+```bash
+cat ~/bots/mustaqbal-bot/logs/.last-cron       # لازم يتحدث كل 5 دقائق
+cat ~/bots/mustaqbal-bot/logs/.last-watchdog   # لازم يتحدث كل دقيقة
+```
+
+لو `.last-cron` وقف يتحدث، يبقى الـ cron في hPanel اتشال أو اتعطّل.
 
 ## أوامر الإدارة
 

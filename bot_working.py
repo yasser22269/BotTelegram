@@ -101,9 +101,14 @@ def save_data():
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 
+def menu_categories():
+    """Categories offered in the menus — locked to what the bot actually posts."""
+    return {k: v for k, v in ALL_CATEGORIES.items() if k in ACTIVE_CATEGORIES}
+
+
 def reply_category_keyboard(selected):
     rows = []
-    for k, v in ALL_CATEGORIES.items():
+    for k, v in menu_categories().items():
         prefix = "✅ " if k in selected else ""
         rows.append([f"{prefix}{k}. {v}"])
     rows.append(["✔️ تأكيد التصنيفات"])
@@ -113,21 +118,10 @@ def reply_category_keyboard(selected):
 def channel_menu_keyboard():
     """Inline keyboard for the subscription menu posted in channel."""
     rows = []
-    for k, v in ALL_CATEGORIES.items():
+    for k, v in menu_categories().items():
         rows.append([InlineKeyboardButton(f"🔔 {v}", callback_data=f"sub_{k}")])
     rows.append([InlineKeyboardButton("📋 اشتراكاتي الحالية", callback_data="my_subs")])
     return InlineKeyboardMarkup(rows)
-
-
-def job_subscribe_keyboard(cat_id):
-    """Subscribe button on job posts — uses jsub_ prefix (subscribe-only, no toggle)."""
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            f"🔔 اشترك في {ALL_CATEGORIES.get(cat_id, 'هذا التصنيف')}",
-            callback_data=f"jsub_{cat_id}"
-        ),
-        InlineKeyboardButton("📋 اشتراكاتي", callback_data="my_subs"),
-    ]])
 
 
 # ── Callback query (channel button clicks) ───────────────────────────────────
@@ -284,25 +278,14 @@ def toggle_category(bot, chat_id, user_id, cat):
 
 # ── Broadcast helper ──────────────────────────────────────────────────────────
 
-def broadcast(bot, content, target_cats, keyboard=None, reporter_chat_id=None):
+def broadcast(bot, content, target_cats, reporter_chat_id=None):
+    """Channel-only delivery — subscriber DMs and subscribe buttons were retired."""
     channel_ok = False
     try:
-        bot.send_message(FREELANCER_CHANNEL_ID, content,
-                         reply_markup=keyboard, parse_mode=None)
+        bot.send_message(FREELANCER_CHANNEL_ID, content, parse_mode=None)
         channel_ok = True
     except Exception as e:
         logger.error(f"القناة: {e}")
-
-    targets = [u for u in users.values()
-               if any(c in u.get("categories", []) for c in target_cats)]
-    sent = failed = 0
-    for u in targets:
-        try:
-            bot.send_message(u["chat_id"], content)
-            sent += 1
-            time.sleep(0.05)
-        except Exception:
-            failed += 1
 
     if reporter_chat_id:
         cat_names = "\n".join([f"• {ALL_CATEGORIES[c]}" for c in target_cats])
@@ -311,11 +294,9 @@ def broadcast(bot, content, target_cats, keyboard=None, reporter_chat_id=None):
             reporter_chat_id,
             f"✅ تم الإرسال!\n\n"
             f"📢 القناة: {channel_status}\n"
-            f"📂 التصنيفات:\n{cat_names}\n\n"
-            f"👥 المستهدفون: {len(targets)}\n"
-            f"✅ نجح: {sent}  |  ❌ فشل: {failed}"
+            f"📂 التصنيفات:\n{cat_names}"
         )
-    return sent, failed
+    return channel_ok
 
 
 # ── Admin: /menu ──────────────────────────────────────────────────────────────
@@ -354,9 +335,7 @@ def admin_post_step2(bot, chat_id, admin_id, content):
     if not state:
         return
     cats = state["categories"]
-    # Attach subscribe button if single category
-    kb = job_subscribe_keyboard(cats[0]) if len(cats) == 1 else None
-    broadcast(bot, content, cats, keyboard=kb, reporter_chat_id=chat_id)
+    broadcast(bot, content, cats, reporter_chat_id=chat_id)
 
 
 # ── Admin: /newpost wizard ────────────────────────────────────────────────────
@@ -426,8 +405,7 @@ def newpost_confirm(bot, chat_id, admin_id):
     if not target_cats:
         bot.send_message(chat_id, "❌ تصنيفات غير صحيحة، تم الإلغاء.")
         return
-    kb = job_subscribe_keyboard(target_cats[0]) if len(target_cats) == 1 else None
-    broadcast(bot, build_post(state["data"]), target_cats, keyboard=kb,
+    broadcast(bot, build_post(state["data"]), target_cats,
               reporter_chat_id=chat_id)
 
 
@@ -796,26 +774,13 @@ def upwork_loop(bot):
                 logger.info(f"Upwork: {len(new)} وظيفة جديدة")
             for jid, job in new.items():
                 try:
-                    content  = format_upwork(job)
-                    keyboard = job_subscribe_keyboard("2")
+                    content = format_upwork(job)
                     try:
-                        bot.send_message(FREELANCER_CHANNEL_ID, content, reply_markup=keyboard)
+                        bot.send_message(FREELANCER_CHANNEL_ID, content)
                     except Exception as e:
                         logger.error(f"Upwork القناة: {e}")
 
-                    targets = [u for u in users.values()
-                               if isinstance(u, dict) and "2" in u.get('categories', [])]
-                    sent = failed = 0
-                    for u in targets:
-                        try:
-                            bot.send_message(u['chat_id'], content)
-                            sent += 1
-                            time.sleep(0.05)
-                        except Exception as dm_e:
-                            failed += 1
-                            logger.warning(f"Upwork DM فشل → {u.get('name','?')}: {dm_e}")
-
-                    logger.info(f"Upwork نُشر {jid} | {sent} نجح / {failed} فشل | {job['title'][:40]}")
+                    logger.info(f"Upwork نُشر {jid} | {job['title'][:40]}")
                     upwork_seen_ids.add(jid)
                     save_data()
                     time.sleep(2)
@@ -858,33 +823,16 @@ def scraper_loop(bot):
                         time.sleep(3)
                         continue
 
-                    content  = format_scraped(p)
-                    keyboard = job_subscribe_keyboard(cat_id)
+                    content = format_scraped(p)
 
-                    # Post to channel
+                    # Channel-only delivery: no subscribe buttons, no DMs.
                     try:
-                        bot.send_message(FREELANCER_CHANNEL_ID, content, reply_markup=keyboard)
+                        bot.send_message(FREELANCER_CHANNEL_ID, content)
                     except Exception as e:
                         logger.error(f"القناة #{pid}: {e}")
 
-                    # Send DM to subscribed users
-                    targets = [u for u in users.values()
-                               if isinstance(u, dict) and cat_id in u.get('categories', [])]
-                    sent = failed = 0
-                    for u in targets:
-                        try:
-                            bot.send_message(u['chat_id'], content)
-                            sent += 1
-                            time.sleep(0.05)
-                        except Exception as e:
-                            failed += 1
-                            logger.warning(f"DM فشل → {u.get('name','?')} [{u['chat_id']}]: {e}")
-
                     cat_name = ALL_CATEGORIES.get(cat_id, cat_id)
-                    logger.info(
-                        f"نُشر #{pid} [{cat_name}] | إشعارات: {sent} نجح / {failed} فشل"
-                        f" | {p['title'][:40]}"
-                    )
+                    logger.info(f"نُشر #{pid} [{cat_name}] | {p['title'][:40]}")
 
                     seen_ids.add(pid)
                     save_data()
