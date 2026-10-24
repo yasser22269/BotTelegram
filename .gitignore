@@ -46,4 +46,9 @@ wheels/
 # مخزن مؤقت
 .cache/
 .pytest_cache/
+.venv/
+logs/
+.bot.lock
+.keepalive.lock
+.watchdog.lock
 

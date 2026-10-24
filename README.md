@@ -39,8 +39,11 @@ copy .env.example .env
 - `ADMIN_ID`: معرّف تيليجرام الخاص بك
 
 ### 4. تشغيل البوت
+
+النسخة المنشورة الحالية هي `bot_working.py`. راجع [DEPLOY.md](DEPLOY.md) لحالة
+Hostinger والمراقبة؛ لا تشغّل نسخة محلية بالتزامن مع نسخة السيرفر.
 ```bash
-python bot.py
+python bot_working.py
 ```
 
 ## الأوامر المتاحة 📋

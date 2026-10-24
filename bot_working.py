@@ -6,9 +6,9 @@ Freelancer Bot - channel-native subscriptions, mostaql scraper
 
 import sys
 import io
-if hasattr(sys.stdout, 'buffer'):
+if __name__ == '__main__' and hasattr(sys.stdout, 'buffer'):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-if hasattr(sys.stderr, 'buffer'):
+if __name__ == '__main__' and hasattr(sys.stderr, 'buffer'):
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 import os
@@ -24,18 +24,25 @@ from dotenv import load_dotenv
 from telegram import (Bot, InlineKeyboardMarkup, InlineKeyboardButton,
                        ReplyKeyboardMarkup, ReplyKeyboardRemove)
 from telegram.utils.request import Request
+from bot_runtime import Health, RedactTokens, atomic_json, safe_error
 
-load_dotenv()
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(APP_DIR, '.env'))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
+for handler in logging.getLogger().handlers:
+    handler.addFilter(RedactTokens())
 
 TELEGRAM_TOKEN        = os.getenv('TELEGRAM_TOKEN')
 ADMIN_ID              = int(os.getenv('ADMIN_ID', '0'))
 FREELANCER_CHANNEL_ID = int(os.getenv('FREELANCER_CHANNEL_ID', '0'))
 SCRAPE_INTERVAL       = int(os.getenv('SCRAPE_INTERVAL', '300'))
+SCRAPE_INTERVAL = max(60, SCRAPE_INTERVAL)
 
 DATA_FILE = os.path.join(os.path.dirname(__file__), 'users_data.json')
+HEALTH = Health(os.path.join(APP_DIR, 'logs', 'health.json'))
+DATA_LOCK = threading.Lock()
 
 ALL_CATEGORIES = {
     "1": "أعمال وخدمات استشارية",
@@ -71,6 +78,7 @@ _upwork_refresh_token = os.getenv('UPWORK_REFRESH_TOKEN', '')
 
 users            = {}   # {user_id(int): {"name", "chat_id", "categories"}}
 seen_ids         = set()
+pending_projects = {}
 upwork_seen_ids  = set()
 admin_state      = {}
 last_id          = 0
@@ -80,23 +88,25 @@ BOT_USERNAME     = ""   # set after get_me()
 # ── Storage ───────────────────────────────────────────────────────────────────
 
 def load_data():
-    global users, seen_ids, upwork_seen_ids
+    global users, seen_ids, upwork_seen_ids, pending_projects
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
         users           = {int(k): v for k, v in data.get('users', {}).items()}
         seen_ids        = set(data.get('seen_ids', []))
+        pending_projects = {int(k): v for k, v in data.get('pending_projects', {}).items()}
         upwork_seen_ids = set(data.get('upwork_seen_ids', []))
     logger.info(f"تم تحميل {len(users)} مستخدم، {len(seen_ids)} مستقل / {len(upwork_seen_ids)} Upwork")
 
 
 def save_data():
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump({
-            'users':           {str(k): v for k, v in users.items()},
-            'seen_ids':        list(seen_ids)[-2000:],
-            'upwork_seen_ids': list(upwork_seen_ids)[-2000:],
-        }, f, ensure_ascii=False, indent=2)
+    with DATA_LOCK:
+        atomic_json(DATA_FILE, {
+            'users':           {str(k): dict(v) for k, v in list(users.items())},
+            'seen_ids':        sorted(seen_ids)[-2000:],
+            'upwork_seen_ids': sorted(upwork_seen_ids)[-2000:],
+            'pending_projects': dict(pending_projects),
+        })
 
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
@@ -529,6 +539,7 @@ def extract_category_from_breadcrumb(soup):
 def fetch_listing():
     resp = requests.get('https://mostaql.com/projects',
                         headers=SCRAPE_HEADERS, timeout=15)
+    resp.raise_for_status()
     soup = BeautifulSoup(resp.text, 'html.parser')
     result = {}
     for a in soup.select('h2 a, h3 a'):
@@ -540,11 +551,14 @@ def fetch_listing():
             pid = int(m.group(1))
             url = href if href.startswith('http') else 'https://mostaql.com' + href
             result[pid] = url
+    if not result:
+        raise ValueError('Mostaql returned no project links; empty or changed HTML')
     return result
 
 
 def scrape_project(url):
     resp = requests.get(url, headers=SCRAPE_HEADERS, timeout=15)
+    resp.raise_for_status()
     soup = BeautifulSoup(resp.text, 'html.parser')
     text = soup.get_text(separator=' ', strip=True)
 
@@ -578,6 +592,8 @@ def scrape_project(url):
 
     # Extract category: breadcrumb first, keyword fallback second
     category_id = extract_category_from_breadcrumb(soup) or map_category(text)
+    if not title or not category_id or not soup.select_one('.carda__content'):
+        raise ValueError('Mostaql project page is incomplete or its layout changed')
 
     # Extract actual project description from mostaql's content card
     desc = ''
@@ -793,57 +809,79 @@ def upwork_loop(bot):
         time.sleep(SCRAPE_INTERVAL)
 
 
+def deliver_project(bot, pid, url):
+    p = scrape_project(url)
+    cat_id = p.get('category_id')
+    if not cat_id:
+        raise ValueError(f'Unknown category for project {pid}')
+    if cat_id in ACTIVE_CATEGORIES:
+        bot.send_message(FREELANCER_CHANNEL_ID, format_scraped(p))
+        HEALTH.update(delivery_ok_at=time.time(), delivery_project_id=pid)
+        logger.info(f"نُشر #{pid} [{ALL_CATEGORIES.get(cat_id, cat_id)}] | {p['title'][:40]}")
+    else:
+        logger.info(f"تخطي #{pid} — تصنيف [{cat_id}] غير مفعّل: {p.get('title','')[:40]}")
+    seen_ids.add(pid)
+    pending_projects.pop(pid, None)
+    save_data()
+
+
+def scrape_cycle(bot):
+    HEALTH.update(scrape_attempt_at=time.time())
+    projects = fetch_listing()
+    HEALTH.update(listing_ok_at=time.time(), listing_count=len(projects))
+
+    # Seed only a brand-new installation. A restart must not discard missed jobs.
+    if not seen_ids and not pending_projects:
+        seen_ids.update(projects)
+        save_data()
+        logger.info(f"Scraper init: {len(projects)} مشروع موجود محفوظ")
+        return
+
+    pending_projects.update({pid: url for pid, url in projects.items() if pid not in seen_ids})
+    save_data()
+    # Persist pending URLs so a failed delivery survives restarts and listing turnover.
+    first_error = None
+    for pid, url in sorted(pending_projects.items()):
+        HEALTH.update(scrape_attempt_at=time.time())
+        try:
+            deliver_project(bot, pid, url)
+        except Exception as e:
+            logger.error('Project %s pending retry: %s', pid, safe_error(e))
+            if getattr(getattr(e, 'response', None), 'status_code', None) in (403, 429):
+                raise
+            first_error = first_error or e
+        time.sleep(3)
+    if first_error:
+        raise first_error
+
+
 def scraper_loop(bot):
     logger.info(f"Scraper بدأ — كل {SCRAPE_INTERVAL}s")
-    try:
-        existing = fetch_listing()
-        for pid in existing:
-            seen_ids.add(pid)
-        save_data()
-        logger.info(f"Scraper init: {len(existing)} مشروع موجود محفوظ")
-    except Exception as e:
-        logger.error(f"Scraper init: {e}")
-
-    time.sleep(SCRAPE_INTERVAL)
-
     while True:
+        # Keep backoff across PM2/hosting restarts, including long source outages.
+        retry_at = HEALTH.snapshot().get('scrape_retry_at', 0)
+        time.sleep(max(0, min(1800, retry_at - time.time())))
         try:
-            projects = fetch_listing()
-            new = {pid: url for pid, url in projects.items() if pid not in seen_ids}
-            if new:
-                logger.info(f"Scraper: {len(new)} مشروع جديد")
-            for pid, url in new.items():
-                try:
-                    p = scrape_project(url)
-                    cat_id = p.get('category_id')
-                    if not cat_id or cat_id not in ACTIVE_CATEGORIES:
-                        logger.info(f"تخطي #{pid} — تصنيف [{cat_id}] غير مفعّل: {p.get('title','')[:40]}")
-                        seen_ids.add(pid)
-                        save_data()
-                        time.sleep(3)
-                        continue
-
-                    content = format_scraped(p)
-
-                    # Channel-only delivery: no subscribe buttons, no DMs.
-                    try:
-                        bot.send_message(FREELANCER_CHANNEL_ID, content)
-                    except Exception as e:
-                        logger.error(f"القناة #{pid}: {e}")
-
-                    cat_name = ALL_CATEGORIES.get(cat_id, cat_id)
-                    logger.info(f"نُشر #{pid} [{cat_name}] | {p['title'][:40]}")
-
-                    seen_ids.add(pid)
-                    save_data()
-                    time.sleep(3)
-                except Exception as e:
-                    logger.error(f"خطأ #{pid}: {e}")
-                    seen_ids.add(pid)
+            scrape_cycle(bot)
+            HEALTH.update(scrape_ok_at=time.time(), scrape_error='', scrape_failures=0,
+                          scrape_retry_at=time.time() + SCRAPE_INTERVAL)
         except Exception as e:
-            logger.error(f"Scraper: {e}")
+            delay = HEALTH.failed(e, SCRAPE_INTERVAL)
+            logger.error('Scraper failed; retry in %ss: %s', delay, safe_error(e))
 
-        time.sleep(SCRAPE_INTERVAL)
+
+def admin_health(bot, chat_id):
+    state = HEALTH.snapshot()
+    error = state.get('scrape_error')
+    last_ok = state.get('scrape_ok_at')
+    age = f"{int((time.time() - last_ok) / 60)} دقيقة" if last_ok else 'لم ينجح منذ تفعيل المراقبة'
+    retry = max(0, int(state.get('scrape_retry_at', 0) - time.time()))
+    bot.send_message(chat_id,
+                     f"حالة جلب المشاريع: {'متعطل' if error else 'يعمل' if last_ok else 'قيد الفحص'}\n"
+                     f"آخر نجاح: {age}\n"
+                     f"مشاريع معلقة: {len(pending_projects)}\n"
+                     f"المحاولة التالية خلال: {retry} ثانية\n"
+                     f"{error or ''}")
 
 
 # ── Main dispatcher ───────────────────────────────────────────────────────────
@@ -855,6 +893,7 @@ def handle_msg(bot, chat_id, user_id, text, name):
 
     # ── Admin ──
     if user_id == ADMIN_ID:
+        if text == "/health":  admin_health(bot, chat_id); return
         if text == "/stats":   admin_stats(bot, chat_id);  return
         if text == "/users":   admin_users(bot, chat_id);  return
         if text == "/menu":    post_channel_menu(bot, chat_id); return
@@ -900,18 +939,31 @@ def main():
     global last_id, BOT_USERNAME
     if not TELEGRAM_TOKEN:
         print("❌ TELEGRAM_TOKEN مفقود!")
-        return
+        raise SystemExit(1)
+
+    # Linux advisory lock is released by the kernel even after SIGKILL.
+    # This also blocks accidental local/manual duplicate launches on this host.
+    instance_lock = None
+    if os.name == 'posix':
+        import fcntl
+        instance_lock = open(os.path.join(APP_DIR, '.bot.lock'), 'a')
+        try:
+            fcntl.flock(instance_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit('Another bot instance is already running')
 
     load_data()
+    HEALTH.update(started_at=time.time(), pid=os.getpid(), poll_ok_at=0)
 
-    request = Request(connect_timeout=10, read_timeout=10)
+    request = Request(con_pool_size=4, connect_timeout=10, read_timeout=20)
     bot = Bot(token=TELEGRAM_TOKEN, request=request)
 
     try:
         info = bot.get_me()
         BOT_USERNAME = info.username
     except Exception as e:
-        print(f"❌ فشل الاتصال: {e}"); return
+        logger.error('Telegram startup failed: %s', safe_error(e))
+        raise SystemExit(1)
 
     print("\n" + "="*60)
     print("✅ البوت يعمل الآن!")
@@ -936,6 +988,7 @@ def main():
                 timeout=10,
                 allowed_updates=ALLOWED_UPDATES,
             )
+            HEALTH.update(poll_ok_at=time.time())
             for update in updates:
                 last_id = update.update_id
 
