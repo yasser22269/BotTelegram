@@ -79,6 +79,8 @@ _upwork_refresh_token = os.getenv('UPWORK_REFRESH_TOKEN', '')
 users            = {}   # {user_id(int): {"name", "chat_id", "categories"}}
 seen_ids         = set()
 pending_projects = {}
+project_failures = {}   # {pid: parse failures}; unparseable projects are dropped, not retried forever
+MAX_PROJECT_ATTEMPTS = 5
 upwork_seen_ids  = set()
 admin_state      = {}
 last_id          = 0
@@ -513,6 +515,17 @@ SCRAPE_HEADERS = {
     'Accept-Language': 'ar,en-US;q=0.9',
 }
 
+# Mostaql blocks the Hostinger IP at its load balancer; an optional relay fetches on our behalf.
+MOSTAQL_RELAY     = os.getenv('MOSTAQL_RELAY', '').strip()
+MOSTAQL_RELAY_KEY = os.getenv('MOSTAQL_RELAY_KEY', '')
+
+
+def mostaql_get(url):
+    if not MOSTAQL_RELAY:
+        return requests.get(url, headers=SCRAPE_HEADERS, timeout=15)
+    return requests.get(MOSTAQL_RELAY, params={'url': url},
+                        headers={'X-Relay-Key': MOSTAQL_RELAY_KEY}, timeout=25)
+
 
 def map_category(text):
     """Keyword fallback — used only when breadcrumb extraction fails."""
@@ -537,8 +550,7 @@ def extract_category_from_breadcrumb(soup):
 
 
 def fetch_listing():
-    resp = requests.get('https://mostaql.com/projects',
-                        headers=SCRAPE_HEADERS, timeout=15)
+    resp = mostaql_get('https://mostaql.com/projects')
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, 'html.parser')
     result = {}
@@ -556,11 +568,34 @@ def fetch_listing():
     return result
 
 
+class ProjectGone(Exception):
+    """Mostaql redirects deleted/hidden projects to the listing page."""
+
+
+def meta_value(soup, label):
+    for row in soup.select('.meta-row'):
+        lbl = row.select_one('.meta-label')
+        val = row.select_one('.meta-value')
+        if lbl and val and lbl.get_text(strip=True) == label:
+            return ' '.join(val.get_text(' ', strip=True).split())
+    # Employer stats (hiring rate, ...) live in a two-column table instead of meta-rows.
+    for row in soup.select('table.table-meta tr'):
+        cells = row.find_all('td')
+        if len(cells) == 2 and cells[0].get_text(strip=True) == label:
+            return cells[1].get_text(' ', strip=True)
+    return ''
+
+
 def scrape_project(url):
-    resp = requests.get(url, headers=SCRAPE_HEADERS, timeout=15)
+    resp = mostaql_get(url)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, 'html.parser')
     text = soup.get_text(separator=' ', strip=True)
+
+    canonical = soup.find('link', rel='canonical')
+    # Only a real Mostaql page pointing elsewhere counts; maintenance/error pages stay retryable.
+    if canonical and '/project/' not in canonical.get('href', ''):
+        raise ProjectGone('Project was removed from Mostaql')
 
     title = ''
     if soup.title:
@@ -570,25 +605,18 @@ def scrape_project(url):
         h = soup.find('h1') or soup.find('h2')
         title = h.get_text(strip=True) if h else ''
 
-    bm = re.search(r'\$[\d,]+\.?\d*\s*[-–]\s*\$[\d,]+\.?\d*', text)
-    budget = bm.group(0).strip() if bm else ''
+    budget   = meta_value(soup, 'الميزانية')
+    duration = meta_value(soup, 'مدة التنفيذ')
+    rating   = meta_value(soup, 'معدل التوظيف')
 
-    dm = re.search(r'(\d+)\s*(يوماً|يوما|يوم|أيام)', text)
-    duration = f"{dm.group(1)} {dm.group(2)}" if dm else ''
-
-    rm = re.search(r'(\d+\.\d+)\s*%', text)
-    rating = f"{rm.group(1)}%" if rm else ''
-
-    date_m = re.search(
-        r'(\d{1,2})\s+(يناير|فبراير|مارس|أبريل|مايو|يونيو|يوليو|أغسطس|سبتمبر|أكتوبر|نوفمبر|ديسمبر)\s+(\d{4})',
-        text)
-    date_str = (f"{date_m.group(1)} {date_m.group(2)} {date_m.group(3)}"
-                if date_m else datetime.now().strftime('%d/%m/%Y'))
+    published = soup.select_one('time[itemprop="datePublished"]')
+    date_str = (published.get('datetime', '')[:16] if published
+                else datetime.now().strftime('%Y-%m-%d %H:%M'))
 
     client = ''
-    client_a = soup.find('a', href=re.compile(r'mostaql\.com/users/|^/users/'))
-    if client_a:
-        client = client_a.get_text(strip=True)
+    client_el = soup.select_one('[data-type="employer_widget"] .profile__name')
+    if client_el:
+        client = client_el.get_text(strip=True)
 
     # Extract category: breadcrumb first, keyword fallback second
     category_id = extract_category_from_breadcrumb(soup) or map_category(text)
@@ -624,7 +652,7 @@ def format_scraped(p):
     client_line   = f"👤 {p['client']}\n"                                          if p.get('client')      else ""
     budget_line   = f"💵 {p['budget']}\n"                                          if p.get('budget')      else ""
     dur_line      = f"⌛ {p['duration']}\n"                                        if p.get('duration')    else ""
-    rating_line   = f"📊 {p['rating']}\n"                                          if p.get('rating')      else ""
+    rating_line   = f"📊 معدل التوظيف: {p['rating']}\n"                                     if p.get('rating')      else ""
     date_line     = f"✍️ {p['date']}\n"                                            if p.get('date')        else ""
     cat_id        = p.get('category_id')
     cat_line      = f"📂 {ALL_CATEGORIES[cat_id]}\n"                               if cat_id               else ""
@@ -810,7 +838,12 @@ def upwork_loop(bot):
 
 
 def deliver_project(bot, pid, url):
-    p = scrape_project(url)
+    try:
+        p = scrape_project(url)
+    except ProjectGone:
+        logger.info(f"تخطي #{pid} — المشروع اتحذف من مستقل")
+        mark_done(pid)
+        return
     cat_id = p.get('category_id')
     if not cat_id:
         raise ValueError(f'Unknown category for project {pid}')
@@ -820,8 +853,13 @@ def deliver_project(bot, pid, url):
         logger.info(f"نُشر #{pid} [{ALL_CATEGORIES.get(cat_id, cat_id)}] | {p['title'][:40]}")
     else:
         logger.info(f"تخطي #{pid} — تصنيف [{cat_id}] غير مفعّل: {p.get('title','')[:40]}")
+    mark_done(pid)
+
+
+def mark_done(pid):
     seen_ids.add(pid)
     pending_projects.pop(pid, None)
+    project_failures.pop(pid, None)
     save_data()
 
 
@@ -840,19 +878,24 @@ def scrape_cycle(bot):
     pending_projects.update({pid: url for pid, url in projects.items() if pid not in seen_ids})
     save_data()
     # Persist pending URLs so a failed delivery survives restarts and listing turnover.
-    first_error = None
+    # One broken project must not put the whole scraper into backoff; only a source block does.
     for pid, url in sorted(pending_projects.items()):
         HEALTH.update(scrape_attempt_at=time.time())
         try:
             deliver_project(bot, pid, url)
         except Exception as e:
-            logger.error('Project %s pending retry: %s', pid, safe_error(e))
             if getattr(getattr(e, 'response', None), 'status_code', None) in (403, 429):
                 raise
-            first_error = first_error or e
+            HEALTH.update(project_error=f'#{pid}: {safe_error(e)}', project_error_at=time.time())
+            if isinstance(e, ValueError):
+                project_failures[pid] = project_failures.get(pid, 0) + 1
+                if project_failures[pid] >= MAX_PROJECT_ATTEMPTS:
+                    logger.error('Project %s dropped after %s parse failures: %s',
+                                 pid, project_failures[pid], safe_error(e))
+                    mark_done(pid)
+                    continue
+            logger.error('Project %s pending retry: %s', pid, safe_error(e))
         time.sleep(3)
-    if first_error:
-        raise first_error
 
 
 def scraper_loop(bot):

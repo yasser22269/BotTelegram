@@ -15,6 +15,22 @@
 - جلب المشاريع يظل متعطلاً حتى يقبل مستقل طلبات Hostinger. إعادة التشغيل أو تغيير
   HTML parser لا يعالج رفض المصدر. يلزم مراجعة دعم مستقل/Hostinger لهذا الرفض.
 
+## الحل: Relay عبر Cloudflare Worker (25 أكتوبر 2026)
+
+الحظر على IP السيرفر كامل (حتى `robots.txt` يرجع 403)، فالبوت يجلب صفحات مستقل
+عبر Worker بدل الاتصال المباشر:
+
+1. Cloudflare → Workers → Create → الصق `mostaql_relay_worker.js` → Deploy.
+2. Settings → Variables → أضف Secret باسم `RELAY_KEY` بقيمة عشوائية طويلة.
+3. في `~/bots/mustaqbal-bot/.env` على السيرفر:
+   ```
+   MOSTAQL_RELAY=https://<worker-name>.<account>.workers.dev
+   MOSTAQL_RELAY_KEY=<نفس قيمة RELAY_KEY>
+   ```
+4. `pm2 restart mustaqbal-bot` ثم `/health`.
+
+بدون `MOSTAQL_RELAY` يتصل البوت بمستقل مباشرة كما كان.
+
 ## الإصلاحات والمراقبة
 
 - التحقق من أخطاء HTTP وصفحات HTML الفارغة/غير المتوقعة قبل معالجة أي مشروع.

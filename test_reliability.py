@@ -55,6 +55,15 @@ class ReliabilityTests(unittest.TestCase):
         with patch.object(bot.requests, 'get', return_value=self.response(html=html)):
             self.assertEqual(bot.fetch_listing(), {101: 'https://mostaql.com/project/101-example'})
 
+    def test_listing_uses_relay_when_configured(self):
+        html = '<h2><a href="/project/101-example">Example</a></h2>'
+        with patch.object(bot, 'MOSTAQL_RELAY', 'https://relay.example'), \
+                patch.object(bot, 'MOSTAQL_RELAY_KEY', 'k'), \
+                patch.object(bot.requests, 'get', return_value=self.response(html=html)) as get:
+            self.assertEqual(bot.fetch_listing(), {101: 'https://mostaql.com/project/101-example'})
+        get.assert_called_once_with('https://relay.example', params={'url': 'https://mostaql.com/projects'},
+                                    headers={'X-Relay-Key': 'k'}, timeout=25)
+
     def test_project_rejects_http_error(self):
         with patch.object(bot.requests, 'get', return_value=self.response(403)):
             with self.assertRaises(requests.HTTPError):
@@ -72,8 +81,7 @@ class ReliabilityTests(unittest.TestCase):
         with patch.object(bot, 'fetch_listing', return_value={101: 'url'}), \
                 patch.object(bot, 'scrape_project', return_value=project), \
                 patch.object(bot, 'format_scraped', return_value='message'):
-            with self.assertRaises(RuntimeError):
-                bot.scrape_cycle(client)
+            bot.scrape_cycle(client)
             self.assertNotIn(101, bot.seen_ids)
             self.assertEqual(json.loads(Path(bot.DATA_FILE).read_text())['pending_projects'], {'101': 'url'})
             bot.pending_projects.clear()
@@ -100,11 +108,40 @@ class ReliabilityTests(unittest.TestCase):
         with patch.object(bot, 'fetch_listing', return_value={101: 'bad', 102: 'good'}), \
                 patch.object(bot, 'scrape_project', side_effect=[ValueError('invalid'), {'category_id': '2', 'title': 'Good'}]), \
                 patch.object(bot, 'format_scraped', return_value='message'):
-            with self.assertRaises(ValueError):
-                bot.scrape_cycle(client)
+            bot.scrape_cycle(client)
         self.assertNotIn(101, bot.seen_ids)
         self.assertIn(102, bot.seen_ids)
         self.assertEqual(bot.pending_projects, {101: 'bad'})
+
+    def test_unparseable_project_is_dropped_after_max_attempts(self):
+        with patch.object(bot, 'project_failures', {}),                 patch.object(bot, 'fetch_listing', return_value={101: 'bad'}),                 patch.object(bot, 'scrape_project', side_effect=ValueError('invalid')):
+            for _ in range(bot.MAX_PROJECT_ATTEMPTS):
+                bot.scrape_cycle(Mock())
+        self.assertIn(101, bot.seen_ids)
+        self.assertEqual(bot.pending_projects, {})
+
+    def test_removed_project_is_skipped(self):
+        html = '<link rel="canonical" href="https://mostaql.com/projects"><title>المشاريع المفتوحة | مستقل</title>'
+        client = Mock()
+        with patch.object(bot, 'fetch_listing', return_value={101: 'url'}),                 patch.object(bot.requests, 'get', return_value=self.response(html=html)):
+            bot.scrape_cycle(client)
+        client.send_message.assert_not_called()
+        self.assertIn(101, bot.seen_ids)
+
+    def test_project_parses_current_layout(self):
+        html = """<link rel="canonical" href="https://mostaql.com/project/101-x"><title>مشروع ويب | مستقل</title>
+        <ol class="breadcrumb"><a>برمجة، تطوير المواقع والتطبيقات</a></ol>
+        <div class="meta-row"><div class="meta-label">تاريخ النشر</div><div class="meta-value">
+          <time datetime="2026-11-13 12:13:08" itemprop="datePublished">منذ ساعة</time></div></div>
+        <div class="meta-row"><div class="meta-label">الميزانية</div><div class="meta-value"><span>$25.00 - $50.00</span></div></div>
+        <div class="meta-row"><div class="meta-label">مدة التنفيذ</div><div class="meta-value">7 أيام</div></div>
+        <div class="carda__content">وصف المشروع</div>
+        <div data-type="employer_widget"><h5 class="profile__name"><bdi>Mohamed A.</bdi></h5>
+          <table class="table table-meta"><tr><td>معدل التوظيف</td><td>25.00%</td></tr></table></div>"""
+        with patch.object(bot.requests, 'get', return_value=self.response(html=html)):
+            p = bot.scrape_project('https://mostaql.com/project/101-x')
+        self.assertEqual((p['category_id'], p['budget'], p['duration'], p['date'], p['client'], p['rating']),
+                         ('2', '$25.00 - $50.00', '7 أيام', '2026-11-13 12:13', 'Mohamed A.', '25.00%'))
 
     def test_first_install_seeds_without_flooding(self):
         bot.seen_ids.clear()
